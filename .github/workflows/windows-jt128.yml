@@ -1,0 +1,133 @@
+name: Build Hesai JT128 PCAP to PCD (Windows x64)
+
+# Manual build: Actions -> Build Hesai JT128 PCAP to PCD (Windows x64) -> Run workflow
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Windows x64 pcl_tool
+    runs-on: windows-2022
+    timeout-minutes: 350
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout Hesai SDK with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Show source revision and tools
+        run: |
+          git rev-parse HEAD
+          cmake --version
+          Get-Command cl.exe -ErrorAction SilentlyContinue | Out-String
+
+      - name: Install vcpkg
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vp = Join-Path $env:RUNNER_TEMP 'vcpkg'
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git $vp
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg clone failed' }
+          & (Join-Path $vp 'bootstrap-vcpkg.bat') -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg bootstrap failed' }
+          "VCPKG_ROOT=$vp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install PCL and required VTK visualization component
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # pcl_tool includes pcl_visualizer.h and links PCL::visualization.
+          # The visualization feature is mandatory even if enable_viewer=false.
+          & "$env:VCPKG_ROOT\vcpkg.exe" install 'pcl[visualization]:x64-windows' --triplet x64-windows
+          if ($LASTEXITCODE -ne 0) { throw 'PCL dependency installation failed' }
+
+      - name: Configure pcl_tool (NOT just SDK sample)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S tool -B build-jt128 -G 'Visual Studio 17 2022' -A x64 `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            '-DVCPKG_TARGET_TRIPLET=x64-windows' `
+            '-DVCPKG_MANIFEST_MODE=OFF' `
+            '-DWITH_PTCS_USE=OFF' `
+            '-DFIND_CUDA=OFF'
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
+
+      - name: Compile Release pcl_tool
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --build build-jt128 --config Release --target pcl_tool --parallel 4
+          if ($LASTEXITCODE -ne 0) { throw 'Compilation failed' }
+
+      - name: Bundle executable and runtime DLLs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'JT128_Windows_x64'
+          $bin = Join-Path $out 'bin'
+          New-Item -ItemType Directory -Force $bin | Out-Null
+          $exe = Get-ChildItem 'build-jt128' -Recurse -Filter 'pcl_tool.exe' -File |
+            Where-Object { $_.FullName -match 'Release' } | Select-Object -First 1
+          if (-not $exe) { throw 'pcl_tool.exe was not produced' }
+          Copy-Item $exe.FullName (Join-Path $bin 'pcl_tool.exe')
+
+          # Simple broad runtime bundle. May contain DLLs not needed by pcl_tool,
+          # but avoids missing dependencies on a clean Windows machine.
+          $vcpkgBin = Join-Path $env:VCPKG_ROOT 'installed\x64-windows\bin'
+          $dlls = @(Get-ChildItem -Path $vcpkgBin -Filter '*.dll' -File -ErrorAction Stop)
+          if ($dlls.Count -eq 0) { throw 'No vcpkg runtime DLLs found' }
+          $dlls | Copy-Item -Destination $bin
+          Copy-Item 'LICENSE' (Join-Path $out 'Hesai-LICENSE.txt')
+          Copy-Item 'config\tool_sample_config.example.ini' (Join-Path $out 'tool_sample_config.example.ini')
+
+          # Carry third-party license notices for the DLL redistribution.
+          $licRoot = Join-Path $out 'third-party-licenses'
+          New-Item -ItemType Directory -Force $licRoot | Out-Null
+          $share = Join-Path $env:VCPKG_ROOT 'installed\x64-windows\share'
+          Get-ChildItem $share -Directory | ForEach-Object {
+            $copyright = Join-Path $_.FullName 'copyright'
+            if (Test-Path $copyright) {
+              Copy-Item $copyright (Join-Path $licRoot ($_.Name + '.txt'))
+            }
+          }
+
+          $sha = git rev-parse HEAD
+          Set-Content -Path (Join-Path $out 'SOURCE_VERSION.txt') -Value "HesaiLidar_SDK_2.0 commit: $sha"
+          @(
+            'JT128 Windows x64 - Hesai SDK pcl_tool',
+            '',
+            '1) Edit tool_sample_config.example.ini and save as jt128.ini.',
+            '2) Set [source_type] source_type = pcap.',
+            '3) Under [pcap] set pcap_path and correction_file_path to real paths.',
+            '4) Under [pcl] choose save_pcd_binary = true, save_pcd_ascii = false,',
+            '   enable_viewer = false and output_dir = C:/LiDAR/output.',
+            '5) Run from PowerShell:',
+            '   .\bin\pcl_tool.exe .\jt128.ini',
+            '',
+            'Do not omit the JT128 unit-specific correction file.',
+            'Original PCAP is retained; PCD files are the decoded output.',
+            'BUILD VALIDATION: This artifact is compiled, but real-PCAP decode',
+            'must still be tested on a JT128 recording.'
+          ) | Set-Content -Path (Join-Path $out 'README-WINDOWS.txt') -Encoding utf8
+
+          Write-Host "Executable: $($exe.FullName)"
+          Write-Host "Runtime DLL count: $($dlls.Count)"
+          Get-ChildItem $out -Recurse -File | Measure-Object -Property Length -Sum |
+            ForEach-Object { Write-Host ('Bundle size: {0:N1} MiB' -f ($_.Sum / 1MB)) }
+          if ((Get-Item (Join-Path $bin 'pcl_tool.exe')).Length -le 0) {
+            throw 'EXE is empty'
+          }
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hesai-JT128-Windows-x64
+          path: JT128_Windows_x64/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
